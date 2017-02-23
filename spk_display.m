@@ -25,6 +25,8 @@ function [stats hl] = spk_display(dt,spikes,calcium,varargin)
 %           marker sizes
 % - other options
 %           'displaymode',mode  different preset for font sizes, etc.
+%           'gridsize',[nrow ncol]  size of grid
+%           'ncol',ncol         number of columns
 %           'burstdelay',value  specify time length for grouping spikes
 %                               into a single number
 %           'calciumevents' of 'calciumeventsfull'
@@ -58,6 +60,12 @@ while k<length(varargin)
             case 'gridsize'
                 k = k+1;
                 gridsize = varargin{k};
+            case 'ncol'
+                k = k+1;
+                gridsize = [NaN varargin{k}];
+            case 'nrow'
+                k = k+1;
+                gridsize = [varargin{k} NaN];
             case {'color' 'linewidth' 'fullline'}
                 k = k+1;
                 lineoptions.(a) = varargin{k};
@@ -267,6 +275,7 @@ else
         else
             nrow = gridsize(1);
             ncol = gridsize(2);
+            if isnan(nrow), nrow = ceil(ngraph/ncol); elseif isnan(ncol), ncol = ceil(ngraph/nrow); end
             if nrow*ncol<ngraph, error 'more graphs than grid cells', end
         end
         
@@ -289,7 +298,7 @@ else
             for j=1:ncol
                 kgraph = kgraph+1;
                 if kgraph>ngraph, break, end
-                ha(kgraph) = axes('parent',hf,'pos',[A+(j-1)*ww+a B+(nrow-i)*hh+b w h]); %#ok<LAXES>
+                ha(kgraph) = axes('parent',hf,'pos',[A+(j-1)*ww+a B+(nrow-i)*hh+b w h]); 
                 doxlabel(kgraph) = (kgraph>ngraph-ncol);
                 doylabel(kgraph) = (j==1);
             end
@@ -432,8 +441,7 @@ for k=1:ngraph
     end
 
     % display spikes
-    for i=1:length(spikesk)
-        if dorate && i>1, break, end
+    for i=1:(length(spikesk)-dorate)
         fn_spikedisplay(spikesk{i},yspike(i),spikeheight,'parent',ha(k), ...
             'color',spikecol(i),'linewidth',spkwidth)
     end
@@ -477,24 +485,39 @@ for k=1:ngraph
             text('parent',ha(k),'string',str,'units','normalized','pos',[.05 .95]);
         end
     elseif dorate
-        if length(spikesk)~=2, error 'rate display only with 2 spike trains', end
-        idx = (spikesk{2}>1e-3);
-        y0 = yspike(2)-spikeheight/2;
+        ratefact = 3; % a 'spike probability 1' mark will be as high as 3 spikes
+        
+        ksp = length(spikesk); if ksp>2, error 'there can be only 1 or 2 spike set', end
+        idx = (spikesk{ksp}>1e-3);
+        y0 = yspike(ksp)-spikeheight/2;
         if any(idx)
             curhold = ishold(ha(k));
             hold(ha(k),'on')
-            stem(tt(idx),y0+spikesk{2}(idx)*spikeheight,'parent',ha(k), ...
-                'color',spikecol(2),'marker','none','basevalue',y0,'showbaseline','off');
+            stem(tt(idx),y0+ratefact*spikesk{ksp}(idx)*spikeheight,'parent',ha(k), ...
+                'color',spikecol(ksp),'marker','none','basevalue',y0,'showbaseline','off');
             if ~curhold, hold(ha(k),'off'), end
         end
+        
+        % superimpose the ground truth
+        if length(spikesk)==2
+            % spike count
+            spkcount = fn_timevector(spikesk{1},tt,'count');
+            % smooth
+            spkcount = fn_filt(spkcount,.2/dt(k),'l');
+            % scale
+            spkcount = ratefact*spkcount;
+            % display
+            spkcount(spkcount<1e-3) = NaN;
+            line(tt,y0+spkcount*spikeheight,'parent',ha(k),'color',spikecol(1))
+        end
+        
     end
     
     % auto-detect burst and display number of spikes per burst
     if isempty(burstdelay), burstdelay = .3; end
-    spk = spikesk{1};
-    nsp = fn_switch(dorate,1,length(spikesk));
+    nsp = length(spikesk)-dorate;
     dtext = 0; %fn_coordinates(ha(k),'b2a',[1 0],'vector'); dtext = 4*dtext(1);
-    for i=2:nsp, spk = union(spk,spikesk{i}); end
+    spk = zeros(1,0); for i=1:nsp, spk = union(spk,spikesk{i}); end
     if ~isempty(spk)
         delays = diff(spk);
         kburst = [1 1+find(delays>burstdelay)];

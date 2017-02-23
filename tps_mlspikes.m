@@ -104,8 +104,12 @@ if iscell(x)
         [out{:,k}] = tps_mlspikes(x{k},par(k)); 
     end
     varargout = num2cell(out,2);
-    if xiscell, icat = 3:min(4,nout); else icat = 1:nout; end
-    for i=icat, varargout{i} =  [varargout{i}{:}]; end
+    if nout>=3, varargout{3} = [varargout{3}{:}]; end
+    if nout>=4, varargout{4} = [varargout{4}{:}]; end
+    if ~xiscell
+        dim = fn_switch(isvector(varargin{1}),2,3);
+        for i=setdiff(1:nout,[3 4]), varargout{i} = cat(dim,varargout{i}{:}); end
+    end
     return
 end
 
@@ -208,6 +212,7 @@ par.algo.interpmode = 'spline'; % 'linear' or 'spline'; choosing one or
 % but not always (in particular when grid is too coarse 'linear' might be
 % better?)
 par.algo.testflag = 0; % use this for some debugging
+par.algo.dogpu = false;
 spec.algo = struct( ...
     'return__a__unique__spike__train__or__probabilities__or__samples', 'label', ...
     'estimate',     {'MAP' 'proba' 'samples'}, ...
@@ -225,6 +230,8 @@ spec.algo = struct( ...
     'np',   'double', ...
     'nsample',      'double', ...
     'interpmode',   {{'linear' 'spline'}}, ...
+    'using__GPU__implementation', 'label', ...
+    'dogpu','logical', ...
     'unused__parameters', 'label', ...
     'testflag',     'logical' ...
     );
@@ -416,7 +423,14 @@ elseif ~dodrift
     [n Ffit par.F0 LL xest] = backward_fixbaseline(F,par);
 else
     if strcmp(par.display,'steps'), disp 'estimate drifting baseline', end
-    [n Ffit par.F0 LL xest] = backward_driftstate(F,par);
+    if nargout==1 && ~par.dographsummary
+        % not outputing state: this might save space, in particular in
+        % 'samples' mode
+        n = backward_driftstate(F,par); 
+        return
+    else
+        [n Ffit par.F0 LL xest] = backward_driftstate(F,par);
+    end
 end    
 
 % "Assemble" the drift
@@ -628,6 +642,7 @@ if doproba
     cc3 = (cc-3)/decay;
     % (interpolation matrices: interpolated probabilities will be zero where cc<nspike)
     M0 = interp1(cc,eye(nc),cc0,interpmode,0);
+    M0(1,1:2) = [decay 1-decay]; % part of the probability in the 'zero calcium' bin at time t should be interpolated from the first 'non-zero calcium' bin at time t-1
     M1 = interp1(cc,eye(nc),cc1,interpmode,0);
     M2 = interp1(cc,eye(nc),cc2,interpmode,0);
     M3 = interp1(cc,eye(nc),cc3,interpmode,0);
@@ -780,7 +795,7 @@ switch par.drift.effect
         if ~(F0>par.F0(1) && F0<par.F0(2))
             error 'additive drifts: calcium signals must be already normalized by F0'
         else
-            disp 'additive drifts: calcium signals supposed already normalized by F0'
+            %disp 'additive drifts: calcium signals supposed already normalized by F0'
         end
     case 'multiplicative'
         F0 = mean(par.F0);
@@ -805,6 +820,17 @@ doproba = strcmp(estimate,'proba');
 dosample = ismember(estimate,{'sample' 'samples'});
 interpmode = fn_switch(doMAP,par.algo.interpmode,'linear'); % spline interpolation can yield negative weights, which is not acceptable for probabilities
 nsample = fn_switch(dosample,par.algo.nsample,1);
+
+% GPU implementation?
+dogpu = par.algo.dogpu;
+% (function for gpuArray<->array conversion only if requested)
+if dogpu
+    mygpu = @gpuArray;
+    mygather = @gather;
+else
+    mygpu = @(x)x;
+    mygather = @(x)x;
+end
 
 % Special: non-integer spikes
 nonintegerspike = par.special.nonintegerspike_minamp;
@@ -897,10 +923,19 @@ else
     % interpolation and averaging at once; this matrix is obtained by first
     % replacing the continuous distribution by a fine-grain discrete
     % distribution
-    discretesteps = (-6:.05:6); % to be multiplied with sigmab
-    ndrift = length(discretesteps);
-    pdrift = exp(-discretesteps.^2/2);
+    
+    % define bins: central bins have all equal probabilities, while some
+    % extreme bins with lower probabilities are added
+    sides = [-Inf -100 -50 -30 -20 -10 -7 -5 -3 norminv(.04:.04:.96) 3 5 7 10 20 30 50 100 Inf];
+    ndrift = length(sides)-1;
+    ndhalf = (ndrift-1)/2;
+    pdrift = diff(normcdf(sides)); % probability of each bin
+    pdrift(ndhalf+2:end) = fliplr(pdrift(1:ndhalf));  % correct numerical error for the last one
+    discretesteps = norminv(cumsum(pdrift)-pdrift/2); % representative element of each bin has central probability
+    discretesteps(ndhalf+2:end) = -fliplr(discretesteps(1:ndhalf));   % correct numerical error for the last one   
     pdrift = pdrift/sum(pdrift);
+        
+    % matrix for baseline time update
     bb1 = fn_add((1:nb)',discretesteps*(sigmab/db));
     BB = interp1(eye(nb),bb1(:),'linear',NaN); % (nb*ndrift)*nb
     BB = reshape(BB,[nb ndrift nb]);
@@ -909,6 +944,11 @@ else
     BB(isnan(BB)) = 0;
     BB = squeeze(sum(BB.*pdriftc,2)); % nb*nb  
     BB = BB'; % will operate on columns
+    
+    % for the forward step only
+    ldrift = -log(pdrift);
+    ldrift([1 end]) = 100^2/2+log(50);  % an approximative value, instead of Inf
+    ldrift([2 end-1]) = 50^2/2+log(50); % an approximative value, instead of Inf
 end
 
 % Precomputation for the measure after saturation/nonlinearity
@@ -1095,6 +1135,7 @@ if doproba
     cc3 = (cc-3)/decay;
     % (interpolation matrices: interpolated probabilities will be zero where cc<nspike)
     M0 = interp1(cc,eye(nc),cc0,interpmode,0);
+    M0(1,1:2) = [decay 1-decay]; % part of the probability in the 'zero calcium' bin at time t should be interpolated from the first 'non-zero calcium' bin at time t-1
     M1 = interp1(cc,eye(nc),cc1,interpmode,0);
     M2 = interp1(cc,eye(nc),cc2,interpmode,0);
     M3 = interp1(cc,eye(nc),cc3,interpmode,0);
@@ -1105,27 +1146,27 @@ if doproba
     % f1(c) = sum_n n p(n) f((c-n)/decay)
     NS = pspike(2)*M1 + 2*pspike(3)*M2 + 3*pspike(4)*M3;
 elseif dosample
-    %discretesteps = [-6 -5:.5:-2.5 -2:.1:-.1 -.05 0 .05 .1:.1:2 2.5:.5:5 6]; % try a limited number of drifts!
-    %discretesteps = -6:.05:6;
-    %pdrift = exp(-discretesteps.^2/2);
-    %pdrift = pdrift/sum(pdrift);
-    ldrift = -log(pdrift);
     lspike_drift = fn_add(column(lspike),row(ldrift));
 end
 
 % Forward collecting/sampling/smoothing step
-n = zeros(T,nsample);
-xest = zeros(T,2,nsample);
-if dosample, fn_progress('sampling',T), end
+if doproba
+    n = zeros(T,nsample,'single');
+else
+    n = zeros(T,nsample,'uint8');
+end
+doxest = ~doproba || (nargout>=2) || par.dographsummary;
+if doxest, xest = zeros(T,2,nsample,'single'); end
+if dosample && strcmp(par.display,'steps'), fn_progress('sampling',T), end
 for t=1:T
-    if dosample, fn_progress(t), end
+    if dosample && strcmp(par.display,'steps'), fn_progress(t), end
     if t==1
         if doMAP
             if par.drift.baselinestart
                 % impose that the initial calcium level is baseline
                 cidx = 1;
                 ystart = mean(y(1:ceil(0.1/par.dt))); % average over 100ms to get the start value
-                [dum bidx] = min(abs(ystart-xxmeasure(cidx,:))); %#ok<ASGLU>
+                [dum bidx] = min(abs(ystart-xxmeasure(cidx,:))); 
                 LL = lt(cidx,bidx);
             else
                 % LL is the minimum negative log likelihood
@@ -1143,58 +1184,121 @@ for t=1:T
         elseif doproba
             LL = logsumexp(lt(:));
             pt = log2proba(lt);
-            xest(t,1) = sum(row(fn_mult(cc,pt)));
-            xest(t,2) = sum(row(fn_mult(bb,pt)));
+            if doxest
+                xest(t,1) = sum(row(fn_mult(cc,pt)));
+                xest(t,2) = sum(row(fn_mult(bb,pt)));
+            end
+            
+            % now lt represents -log p(xt|y1,..,yt), so we use the time
+            % zero prior and perform a single measure update
+            lt = lcalcium + (lmeasure+(y(t)-xxmeasure).^2/(2*sigmay^2));
         end
     else
         if doMAP
             xest(t,2) = fn_coerce(xest(t-1,2) + D(cidx,bidx,t),baselineinterval);
             bidx = 1+round((xest(t,2)-bb(1))/db);
             n(t) = N(cidx,bidx,t);
-            xest(t,1) = min(xest(t-1,1)*decay + n(t),cmax);
+            xest(t,1) = min(xest(t-1,1)*decay + double(n(t)),cmax);
             cidx = 1+round(xest(t,1)/dc);
         elseif dosample
             % draw calcium and baseline evolutions at once
             % too difficult this time to do all particles at once 
             % -> use a for loop
-            nspike = column(0:nspikmax);                    % putative number of spikes
-            Lt = L(:,:,t);                                  % -log p(yt,..,yT|xt) [size nc*nb]
-            for ksample = 1:nsample
-                ct = xest(t-1,1,ksample)*decay + nspike;    % corresponding putative calcium values
-                bt = xest(t-1,2,ksample) + discretesteps*sigmab;        % putative baseline values
-                ltk0 = interpn(Lt,1+ct/dc,1+(bt-bb(1))/db,'linear',Inf); % -log p(yt,..,yT|ct,Bt) [size (1+nspikmax)*nb]
-                ltk = lspike_drift + ltk0;                   % ~ -log p(xt|x(t-1),yt,..,yT) [size (1+nspikmax)*ndrift]
-                [cidx bidx] = logsample(ltk);
-                n(t,ksample) = cidx-1;
-                xest(t,1,ksample) = ct(cidx);
-                xest(t,2,ksample) = bt(bidx);
+            nspike = column(0:nspikmax);                        % putative number of spikes
+            ct = fn_add(xest(t-1,1,:)*decay, nspike);           % corresponding putative calcium values [(1+nspikmax)*1*nsample]
+            ct1 = repmat(ct,[1 ndrift 1]);                      % idem [(1+nspikmax)*ndrift*nsample]
+            bt = fn_add(xest(t-1,2,:), discretesteps*sigmab);   % putative baseline values [1*ndrift*nsample]
+            bt1 = repmat(bt,[1+nspikmax 1 1]);                  % idem [(1+nspikmax)*ndrift*nsample]
+            Lt = L(:,:,t);                                      % -log p(yt,..,yT|xt) [nc*nb]
+            Lt = mygpu(Lt); % the computation in the next line seems to be the only one where GPU is profitable!
+            ltk0 = interpn(Lt,1+ct1/dc,1+(bt1-bb(1))/db,'linear',Inf); % -log p(yt,..,yT|xt)   [(1+nspikmax)*ndrift*nsample]
+            ltk0 = mygather(ltk0);
+            ltk = bsxfun(@plus,lspike_drift,ltk0);                   % ~ -log p(xt|x(t-1),yt,..,yT) [(1+nspikmax)*ndrift*nsample]
+            [cidx bidx] = logsample(ltk,'2D');                  % [nsample]
+            n(t,:) = cidx-1;
+            xest(t,1,:) = ct(sub2ind([1+nspikmax nsample],cidx,1:nsample));
+            xest(t,2,:) = bt(sub2ind([ndrift nsample],bidx,1:nsample));
+            badsample = all(all(isinf(ltk))); % some samples ran out uncharted low-proba territory: put them back in the max-proba position
+            if any(badsample)
+                xest(t,1,badsample) = 0;
+                [~, bidx] = min(Lt(1,:));
+                xest(t,2,badsample) = bb(bidx);
             end
+            %             for ksample = 1:nsample
+            %                 ct = xest(t-1,1,ksample)*decay + nspike;    % corresponding putative calcium values
+            %                 bt = xest(t-1,2,ksample) + discretesteps*sigmab;        % putative baseline values
+            %                 ltk0 = interpn(Lt,1+ct/dc,1+(bt-bb(1))/db,'linear',Inf); % -log p(yt,..,yT|ct,Bt) [size (1+nspikmax)*nb]
+            %                 ltk = lspike_drift + ltk0;                   % ~ -log p(xt|x(t-1),yt,..,yT) [size (1+nspikmax)*ndrift]
+            %                 [cidx bidx] = logsample(ltk);
+            %                 n(t,ksample) = cidx-1;
+            %                 xest(t,1,ksample) = ct(cidx);
+            %                 xest(t,2,ksample) = bt(bidx);
+            %             end
         elseif doproba
-            % time update
-            % for the moment:
-            % . lt is -log p(x(t-1)|y1,..,y(t-1))
-            % . L(:,:,t) is -log p(yt,..,yT|xt)
-            % complicate ways of computing are needed to avoid numerical
-            % errors
-            lt1 = lt;               % -log p(x(t-1)|y1,..,y(t-1))
-            lmin = min(lt1(:));
-            pt1 = exp(lmin-lt1);    % ~ p(x(t-1)|y1,..,y(t-1))
-            pt = MS*pt1*BB;         % ~ p(xt|y1,..,y(t-1))
-            nt = (NS*pt1*BB)./pt; nt(pt==0) = 0;   % E(nt|xt,b(t-1),y1,..,y(t-1))
-            lt = lmin-log(pt);      % -log p(xt|y1,..,y(t-1))
-            lty = lt + L(:,:,t);    % ~ -log p(xt|y)
-            L(:,:,t) = lty;
-            pty = exp(min(lty(:))-lty);             % ~ p(xt|y)
-            pty = pty/sum(pty(:));
-            n(t) = sum(row(nt.*pty));               % E(nt|y)
-            xest(t,1) = sum(row(fn_mult(cc,pty)));  % E(ct|y)
-            xest(t,2) = sum(row(fn_mult(bb,pty)));  % E(bt|y)
-            
-            % measure update
-            lt = lt + (lmeasure+(y(t)-xxmeasure).^2/(2*sigmay^2));
+            if eval('true')
+                % Below is the implementation described in the paper.
+                % But this does not seem stable enough, in particular,
+                % because it combines the past and future of each t, 
+                % the result can be inconsistant (due to numerical
+                % approximations probably) between time t-1 and time t.
+                % Furthermore, the initialization for this computation is
+                % incorrect, as it should only take y1 into account.
+                
+                % time update
+                % . lt represents information from the past only, it will be
+                %   updated from -log p(x(t-1)|y1,..,y(t-1)) to -log p(xt|y1,..,yt)
+                % . L(:,:,t) is -log p(yt,..,yT|xt), i.e. combines information
+                %   from past and future
+                % note that interpolations must occur in the 'proba' rather
+                % than 'log proba' to be accurate
+                
+                % lt time update
+                lt1 = lt;               % -log p(x(t-1)|y1,..,y(t-1))
+                lmin = min(lt1(:));
+                pt1 = exp(lmin-lt1);    % ~ p(x(t-1)|y1,..,y(t-1))
+                pt1b = pt1*BB;
+                pt = MS*pt1b;% ~ p(xt|y1,..,y(t-1))
+                lt = lmin-log(pt);      % -log p(xt|y1,..,y(t-1))
+                
+                % update L(:,:,t), i.e. combine lt and previous L(:,:,t)
+                lty = lt + L(:,:,t);    % ~ -log p(xt|y)
+                L(:,:,t) = lty;
+                pty = log2proba(lty);   % ~ p(xt|y)
+                
+                % expectancy for number of spikes
+                nt = (NS*pt1b)./pt; nt(pt==0) = 0;      % E(nt|xt,y1,..,y(t-1))
+                n(t) = sum(row(nt.*pty));               % E(nt|y)
+                if doxest
+                    xest(t,1) = sum(row(fn_mult(cc,pty)));  % E(ct|y)
+                    xest(t,2) = sum(row(fn_mult(bb,pty)));  % E(bt|y)
+                end
+                
+                % lt measure update
+                lt = lt + (lmeasure+(y(t)-xxmeasure).^2/(2*sigmay^2));
+            else
+                
+                % Well... an alternative that would produce results more
+                % similar to the 'samples' mode is too difficult to write,
+                % in particular because it might involve square matrices
+                % with side the total number of states
+                
+                error 'not implemented'
+                %                 lt1 = lt;               % -log p(x(t-1)|y1,..,y(t-1))
+                %                 lmin = min(lt1(:));
+                %                 pt1 = exp(lmin-lt1);    % p(x(t-1)|y1,..,y(t-1))
+                %
+                %                 ltfuture = L(:,:,t);    % -log p(xt|yt,..,yT)
+                %                 ptfuture = exp(min(ltfuture(:))-ltfuture);
+                %                 ptfuture = ptfuture/sum(ptfuture(:));   % p(xt|yt,..,yT)
+                
+                
+            end
         end
     end
 end
+
+% We can stop here if we want only spikes
+if ~doxest, return, end
 
 % Graph summary
 if par.dographsummary
@@ -1287,7 +1391,7 @@ switch par.drift.effect
         if ~(F0>par.F0(1) && F0<par.F0(2))
             error 'additive drifts: calcium signals must be already normalized by F0'
         else
-            disp 'additive drifts: calcium signals supposed already normalized by F0'
+            %disp 'additive drifts: calcium signals supposed already normalized by F0'
         end
     case 'multiplicative'
         F0 = mean(par.F0);
@@ -1692,14 +1796,14 @@ if isempty(dim)
 else
     % proba in dimension dim
     % e.g. if dim=2, each row is a probability distribution
-    l = fn_subtract(l, min(l,[],dim));
+    l = bsxfun(@minus,l,min(l,[],dim));
 end
 p = exp(-l);
 p(isnan(p)) = 0;
 if isempty(dim)
     p = p/sum(p(:));
 else
-    p = fn_div(p,sum(p,dim));
+    p = bsxfun(@rdivide,p,sum(p,dim));
 end
 
 %---
@@ -1772,6 +1876,19 @@ Y1e = W*X1e;
 Y = fn_subtract(m,log(Y1e));
 Y(:,isinf(m)) = Inf;
 
+% % We want to avoid Inf in Y (i.e. 0 in Y1e)
+% Yisinf = (Y==Inf);
+% while any(Yisinf(:))
+%     m = m + 700;
+%     X1 = fn_subtract(X,m);
+%     X1 = max(X1,-700);
+%     X1e = exp(-X1);
+%     Y1e = W*X1e;
+%     Y1 = fn_subtract(m,log(Y1e));
+%     Y(Yisinf) = Y1(Yisinf);
+%     Yisinf = (Y==Inf);
+% end
+
 %---
 function Y = logmultexp_column(W,X)
 % function Y = logmultexp_column(W,X)
@@ -1794,18 +1911,33 @@ Y1e = X1e*W;
 Y = fn_subtract(m,log(Y1e));
 Y(isinf(m),:) = Inf;
 
+% % We want to avoid Inf in Y (i.e. 0 in Y1e)
+% Yisinf = (Y==Inf);
+% while any(Yisinf(:))
+%     m = m + 700;
+%     X1 = fn_subtract(X,m);
+%     X1 = max(X1,-700);
+%     X1e = exp(-X1);
+%     Y1e = X1e*W;
+%     Y1 = fn_subtract(m,log(Y1e));
+%     Y(Yisinf) = Y1(Yisinf);
+%     Yisinf = (Y==Inf);
+% end
+
 %---
-function varargout = logsample(l,nsample_flag)
+function varargout = logsample(l,nsample_flag,dogpu)
 % function [ii jj ...] = logsample(l,nsample|flag)
 %---
 % draw samples from the negative log probability distribution
 
-if nargin<2, nsample_flag=1; end
+if nargin<2, nsample_flag = 1; end
+if nargin<3, dogpu = false; end
 
 if isnumeric(nsample_flag)
     p = log2proba(l);
     nsample = nsample_flag;
     idx = 1 + sum(bsxfun(@gt,rand(1,nsample),cumsum(p(:))));
+    if dogpu, idx = gather(idx); end
     switch nargout
         case 1
             if ~isvector(l), error 'two outputs when l is a matrix', end
@@ -1814,10 +1946,64 @@ if isnumeric(nsample_flag)
             [ii jj] = ind2sub(size(l),idx);
             varargout = {ii jj};
     end
-elseif strcmp(nsample_flag,'rows')
-    % each row is a different distribution
-    p = log2proba(l,2);
-    nsample = size(l,1);
-    idx = 1 + sum(bsxfun(@gt,rand(nsample,1),cumsum(p,2)),2);
-    varargout = {idx};
+else
+    switch nsample_flag
+        case 'rows'
+            % each row is a different distribution
+            p = log2proba(l,2);
+            nsample = size(l,1);
+            idx = 1 + sum(bsxfun(@gt,rand(nsample,1),cumsum(p,2)),2);
+            if dogpu, idx = gather(idx); end
+            varargout = {idx};
+        case '2D'
+            % each 2D array is a different distribution
+            [nx ny nsample] = size(l);
+            nstate = nx*ny;
+            l = reshape(l,[nstate nsample]);
+            p = log2proba(l,1);
+            random = rand(1,nsample);
+            pcum = cumsum(p,1);
+            idx = 1 + sum(bsxfun(@gt,random,pcum),1);
+            if dogpu, idx = gather(idx); end
+            [ii jj] = ind2sub([nx ny],idx);
+            varargout = {ii jj};
+    end
 end
+
+%---
+function x = gpuconvert(x)
+
+if isnumeric(x)
+    x = gpuArray(x);
+elseif isstruct(x)
+    if ~isscalar(x), error 'not handled yet', end
+    F = fieldnames(x);
+    for i=1:length(F)
+        f = F{i};
+        x.(f) = gpuconvert(x.(f));
+    end
+elseif iscell(x)
+    for i=1:numel(x)
+        x{i} = gpuconvert(x{i});
+    end
+elseif islogical(x) && ~isscalar(x) && fn_dodebug
+    disp 'convert or not convert?'
+    keyboard
+elseif islogical(x) || ischar(x)
+    % do not convert
+else
+    error 'class not handled'
+end
+        
+%---
+function x = gpuConvertPar(x)
+
+if ~isstruct(x) || ~isscalar(x), error 'argument must be a scalar parameters structure', end
+F = fieldnames(x);
+for i=1:length(F)
+    f = F{i};
+    if strcmp(f,'algo'), continue, end % numbers in par.algo define array sizes and are not supposed to be sent to the GPU
+    x.(f) = gpuconvert(x.(f));
+end
+
+
